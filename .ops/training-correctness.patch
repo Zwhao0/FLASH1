@@ -1,0 +1,383 @@
+--- a/Megatron-LM/megatron/training.py
++++ b/Megatron-LM/megatron/training.py
+@@ -5,6 +5,7 @@
+ import gc
+ import dataclasses
+ from datetime import datetime
++import hashlib
+ import math
+ import logging
+ import os
+@@ -31,6 +32,7 @@
+ from megatron import get_num_microbatches
+ from megatron import is_last_rank
+ from megatron import update_num_microbatches
++from megatron.variation_aware.batch_distribution import get_loss_and_grad_weight
+ from megatron.core import mpu, tensor_parallel
+ from megatron.core.utils import get_model_config
+ from megatron import print_rank_0
+@@ -85,6 +87,85 @@
+             + (args.padded_vocab_size / (2 * args.num_layers * args.hidden_size))
+         )
+     )
++
++
++def _uses_failslow_aware_batching(args):
++    """Whether per-DP-rank microbatch redistribution is active."""
++    return (getattr(args, 'failslow_aware', False) and
++            getattr(args, 'rampup_batch_size', None) is None)
++
++
++def _iteration_batch_size(args):
++    """Return the logical global batch, independent of local DP allocation."""
++    if _uses_failslow_aware_batching(args):
++        return args.global_batch_size
++    return (args.micro_batch_size * args.data_parallel_size *
++            get_num_microbatches())
++
++
++def _model_parameters_sha256(model):
++    """Hash every model parameter without materializing the full model on CPU."""
++    digest = hashlib.sha256()
++    for chunk_index, model_chunk in enumerate(model):
++        unwrapped_chunk = unwrap_model(model_chunk)
++        for name, parameter in unwrapped_chunk.named_parameters():
++            tensor = parameter.detach().to(device='cpu').contiguous()
++            metadata = '{}:{}:{}:{}\0'.format(
++                chunk_index, name, tensor.dtype, tuple(tensor.shape))
++            digest.update(metadata.encode('utf-8'))
++            digest.update(
++                tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
++    return digest.hexdigest()
++
++
++def _verify_dp_training_consistency(model, opt_param_scheduler, iteration):
++    """Optionally verify replicated DP model and sample progress at job end."""
++    if os.environ.get('GREYHOUND_VERIFY_DP') != '1':
++        return
++
++    args = get_args()
++    topology = (
++        mpu.get_data_parallel_world_size(),
++        mpu.get_tensor_model_parallel_world_size(),
++        mpu.get_pipeline_model_parallel_world_size(),
++        dist.get_world_size(),
++    )
++    if topology != (4, 1, 1, 4):
++        raise RuntimeError(
++            'GREYHOUND_VERIFY_DP requires DP=4, TP=1, PP=1, world_size=4; '
++            'got {}'.format(topology))
++
++    local_state = {
++        'rank': dist.get_rank(),
++        'parameters_sha256': _model_parameters_sha256(model),
++        'scheduler_num_steps': opt_param_scheduler.num_steps,
++        'consumed_train_samples': args.consumed_train_samples,
++        'iteration': iteration,
++    }
++    gathered_states = [None] * dist.get_world_size()
++    dist.all_gather_object(gathered_states, local_state)
++
++    comparable_keys = (
++        'parameters_sha256', 'scheduler_num_steps',
++        'consumed_train_samples', 'iteration')
++    passed = all(
++        all(state[key] == gathered_states[0][key] for key in comparable_keys)
++        for state in gathered_states[1:]
++    )
++    if passed:
++        print_rank_0(
++            'GREYHOUND_VERIFY_DP PASS: all {} DP ranks agree on full model '
++            'SHA256={}, scheduler_num_steps={}, consumed_train_samples={}, '
++            'iteration={}'.format(
++                len(gathered_states), gathered_states[0]['parameters_sha256'],
++                gathered_states[0]['scheduler_num_steps'],
++                gathered_states[0]['consumed_train_samples'],
++                gathered_states[0]['iteration']))
++    else:
++        print_rank_0(
++            'GREYHOUND_VERIFY_DP FAIL: DP rank states differ: {}'.format(
++                gathered_states))
++        raise RuntimeError('GREYHOUND_VERIFY_DP found divergent DP state')
+ 
+ 
+ def append_to_progress_log(string):
+@@ -581,9 +662,7 @@
+ 
+     # Update learning rate.
+     if update_successful:
+-        increment = get_num_microbatches() * \
+-                    args.micro_batch_size * \
+-                    args.data_parallel_size
++        increment = _iteration_batch_size(args)
+         opt_param_scheduler.step(increment=increment)
+         skipped_iter = 0
+     else:
+@@ -670,8 +749,7 @@
+         'optimizer']
+ 
+     # Calculate batch size.
+-    batch_size = args.micro_batch_size * args.data_parallel_size * \
+-        get_num_microbatches()
++    batch_size = _iteration_batch_size(args)
+ 
+     # Track app tag & app tag ID
+     if one_logger:
+@@ -911,7 +989,14 @@
+     num_floating_point_operations_so_far = args.num_floating_point_operations_so_far
+ 
+     # Setup some training config params
+-    config.grad_scale_func = optimizer.scale_loss
++    if _uses_failslow_aware_batching(args):
++        # Megatron's pipeline schedule divides each rank's local loss by its
++        # microbatch count. Reweight that local mean by local_count / initial_count
++        # so the DP average gives every sample weight 1 / global_batch_size.
++        config.grad_scale_func = lambda loss: optimizer.scale_loss(
++            loss * get_loss_and_grad_weight())
++    else:
++        config.grad_scale_func = optimizer.scale_loss
+     config.timers = timers
+     if isinstance(model[0], DDP) and args.overlap_grad_reduce:
+         assert config.no_sync_func is None, \
+@@ -1012,9 +1097,7 @@
+                        config)
+         iteration += 1
+ 
+-        batch_size = mpu.get_data_parallel_world_size() * \
+-                     args.micro_batch_size * \
+-                     get_num_microbatches()
++        batch_size = _iteration_batch_size(args)
+         args.consumed_train_samples += batch_size
+         num_floating_point_operations_so_far += num_floating_point_operations(args, batch_size)
+ 
+@@ -1151,6 +1234,8 @@
+                 gc.collect()
+ 
+     track_e2e_metrics()
++
++    _verify_dp_training_consistency(model, opt_param_scheduler, iteration)
+ 
+     # Flush TensorBoard and WandB writers.
+     writer = get_tensorboard_writer()
+@@ -1338,6 +1423,14 @@
+         train_samples = args.train_samples
+     else:
+         train_samples = args.train_iters * args.global_batch_size
++    if _uses_failslow_aware_batching(args) and getattr(args, 'mock_data', False):
++        # Each DP rank owns a fixed sampler shard. With uneven local
++        # microbatch counts, the fastest rank can consume up to DP times the
++        # baseline local count, so reserve one DP-world of mock sample capacity.
++        train_samples *= args.data_parallel_size
++        print_rank_0(
++            ' > overprovisioning mock training samples by DP world size: {}'
++            .format(train_samples))
+     eval_iters = (args.train_iters // args.eval_interval + 1) * \
+                  args.eval_iters
+     test_iters = args.eval_iters
+--- a/Megatron-LM/megatron/microbatches.py
++++ b/Megatron-LM/megatron/microbatches.py
+@@ -7,7 +7,12 @@
+ import torch.distributed
+ import logging
+ from megatron.core import mpu
+-from megatron.variation_aware.batch_distribution import init_batch_distribution, set_initial_micro_batch_num, get_my_micro_batch_num
++from megatron.variation_aware.batch_distribution import (
++    get_my_micro_batch_num,
++    get_synchronized_my_micro_batch_num_dp_only,
++    init_batch_distribution,
++    set_initial_micro_batch_num,
++)
+ 
+ _CHECK_INTERVAL = 1
+ 
+@@ -96,17 +101,24 @@
+     def get(self):
+         if not self.inited:
+             init_batch_distribution()
+-            set_initial_micro_batch_num(mpu.get_data_parallel_rank(), self.num_micro_batches)
++            set_initial_micro_batch_num(
++                mpu.get_data_parallel_rank(with_context_parallel=False),
++                self.num_micro_batches)
+             self.inited = True
+         if self.iter_count % _CHECK_INTERVAL == 0 and self.get_check:
+-            tmp_mb_num = get_my_micro_batch_num()
+-            # Add an all-reduce here to sync micro-batch updates
+-            # torch.distributed.all_reduce(torch.tensor([1], device=torch.cuda.current_device()))
++            dp_only = (
++                torch.distributed.is_initialized() and
++                mpu.get_tensor_model_parallel_world_size() == 1 and
++                mpu.get_pipeline_model_parallel_world_size() == 1 and
++                torch.distributed.get_world_size() ==
++                mpu.get_data_parallel_world_size(with_context_parallel=False))
++            if dp_only:
++                tmp_mb_num = get_synchronized_my_micro_batch_num_dp_only()
++            else:
++                tmp_mb_num = get_my_micro_batch_num()
+             if tmp_mb_num != self.num_micro_batches:
+                 logging.info(f"[MicrobatchCalculator] rank {torch.distributed.get_rank()} DP Changed (iter={self.iter_count})")
+                 self.num_micro_batches = tmp_mb_num
+-            # else:
+-            #     logging.info(f"[MicrobatchCalculator] rank {torch.distributed.get_rank()} DP NO change (iter={self.iter_count})")
+             self.get_check = False
+         return self.num_micro_batches
+ 
+--- a/Megatron-LM/megatron/variation_aware/batch_distribution.py
++++ b/Megatron-LM/megatron/variation_aware/batch_distribution.py
+@@ -1,6 +1,6 @@
+-import torch
++import ast
+ import os
+-import torch.distributed
++import torch.distributed as dist
+ import redis
+ 
+ from megatron.core import mpu
+@@ -16,7 +16,7 @@
+     global REDIS_CLIENT, GLOBAL_BATCH_DISTRIBUTION
+     content = REDIS_CLIENT.get('batch_distribution')
+     if content is not None:
+-        GLOBAL_BATCH_DISTRIBUTION = eval(content.decode())
++        GLOBAL_BATCH_DISTRIBUTION = ast.literal_eval(content.decode())
+ 
+ 
+ def init_batch_distribution():
+@@ -32,10 +32,14 @@
+ 
+ 
+ def set_initial_micro_batch_num(my_dp_rank, my_mb_num):
+-    global REDIS_CLIENT, CURRENT_MB_NUM, INITIAL_MB_NUM
++    global REDIS_CLIENT, CURRENT_MB_NUM, INITIAL_MB_NUM, GLOBAL_BATCH_DISTRIBUTION
+     assert REDIS_CLIENT is not None
+     CURRENT_MB_NUM = my_mb_num
+     INITIAL_MB_NUM = my_mb_num
++    GLOBAL_BATCH_DISTRIBUTION = [
++        my_mb_num
++        for _ in range(mpu.get_data_parallel_world_size(with_context_parallel=False))
++    ]
+     REDIS_CLIENT.set(f"init_mb_num_{my_dp_rank}", my_mb_num)
+ 
+ 
+@@ -44,19 +48,104 @@
+     if mpu.is_unitialized():
+         return None
+     my_dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
+-    new_version = int(REDIS_CLIENT.get("dp_version"))
++    version_value, distribution_value = REDIS_CLIENT.mget(
++        'dp_version', 'batch_distribution')
++    new_version = int(version_value or 0)
+     # Case 1: My DP batch distribution is the newest version => Do nothing
+     if new_version == DP_MODIFICATION_VER:
+         return CURRENT_MB_NUM
+     # Case 2: My DP batch distribution should be updated => Update it
+-    sync_global_batch_distribution()
++    if distribution_value is None:
++        raise RuntimeError(
++            'DP plan version {} has no batch_distribution'.format(new_version))
++    GLOBAL_BATCH_DISTRIBUTION = ast.literal_eval(distribution_value.decode())
++    _validate_global_batch_distribution(GLOBAL_BATCH_DISTRIBUTION)
+     print(f"###### DP changed: from {CURRENT_MB_NUM} to {GLOBAL_BATCH_DISTRIBUTION[my_dp_rank]}")
+     CURRENT_MB_NUM = GLOBAL_BATCH_DISTRIBUTION[my_dp_rank]
+     DP_MODIFICATION_VER = new_version
+     return CURRENT_MB_NUM
+ 
+ 
++def _validate_global_batch_distribution(distribution):
++    if not isinstance(distribution, (list, tuple)):
++        raise ValueError('DP plan must be a list or tuple: {}'.format(distribution))
++
++    dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
++    if len(distribution) != dp_size or any(int(value) < 1 for value in distribution):
++        raise ValueError(
++            'DP plan must contain {} positive microbatch counts: {}'.format(
++                dp_size, distribution))
++
++    global_batch_size, micro_batch_size = REDIS_CLIENT.mget(
++        'global_batch_size', 'micro_batch_size')
++    if global_batch_size is None or micro_batch_size is None:
++        raise RuntimeError('global_batch_size/micro_batch_size missing in Redis')
++    global_batch_size = int(global_batch_size)
++    micro_batch_size = int(micro_batch_size)
++    allocated_batch_size = sum(int(value) for value in distribution) * micro_batch_size
++    if allocated_batch_size != global_batch_size:
++        raise ValueError(
++            'DP plan allocates {} samples, expected global batch {}: {}'.format(
++                allocated_batch_size, global_batch_size, distribution))
++
++
++def get_synchronized_my_micro_batch_num_dp_only():
++    """Read one plan on rank 0 and broadcast it to the DP-only world."""
++    global GLOBAL_BATCH_DISTRIBUTION, DP_MODIFICATION_VER, CURRENT_MB_NUM
++
++    if mpu.is_unitialized():
++        return None
++    if (mpu.get_tensor_model_parallel_world_size() != 1 or
++            mpu.get_pipeline_model_parallel_world_size() != 1 or
++            dist.get_world_size() !=
++            mpu.get_data_parallel_world_size(with_context_parallel=False)):
++        raise RuntimeError('DP-only plan broadcast used with non-DP-only topology')
++
++    payload = [None]
++    if dist.get_rank() == 0:
++        try:
++            version_value, distribution_value = REDIS_CLIENT.mget(
++                'dp_version', 'batch_distribution')
++            new_version = int(version_value or 0)
++            if new_version == DP_MODIFICATION_VER:
++                distribution = GLOBAL_BATCH_DISTRIBUTION
++                if distribution is None:
++                    distribution = [INITIAL_MB_NUM] * dist.get_world_size()
++            else:
++                if distribution_value is None:
++                    raise RuntimeError(
++                        'DP plan version {} has no batch_distribution'.format(
++                            new_version))
++                distribution = ast.literal_eval(distribution_value.decode())
++                _validate_global_batch_distribution(distribution)
++            payload[0] = (True, new_version, distribution)
++        except Exception as error:
++            payload[0] = (False, repr(error))
++
++    dist.broadcast_object_list(payload, src=0)
++    success, *result = payload[0]
++    if not success:
++        raise RuntimeError('Failed to read synchronized DP plan: {}'.format(result[0]))
++
++    new_version, distribution = result
++    my_dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
++    if len(distribution) != dist.get_world_size():
++        raise ValueError('DP plan has wrong world size: {}'.format(distribution))
++    new_micro_batch_num = int(distribution[my_dp_rank])
++    version_changed = new_version != DP_MODIFICATION_VER
++    count_changed = CURRENT_MB_NUM != new_micro_batch_num
++    if version_changed or count_changed:
++        print('###### DP changed: from {} to {}'.format(
++            CURRENT_MB_NUM, new_micro_batch_num))
++    GLOBAL_BATCH_DISTRIBUTION = list(distribution)
++    DP_MODIFICATION_VER = new_version
++    CURRENT_MB_NUM = new_micro_batch_num
++    return CURRENT_MB_NUM
++
++
+ def get_loss_and_grad_weight():
++    if INITIAL_MB_NUM <= 0:
++        return 1.0
+     return CURRENT_MB_NUM / INITIAL_MB_NUM
+ 
+ # mpu.get_data_parallel_group()
+--- a/detector/control_plane/mitigation_plan.py
++++ b/detector/control_plane/mitigation_plan.py
+@@ -88,8 +88,12 @@
+             new_dp = solve_dp(time_array, micro_bsz, global_bsz)
+             # microbatch changed
+             self.dp_version += 1
+-            self.client.set('batch_distribution', str(new_dp))
+-            self.client.set("dp_version", self.dp_version)
++            # Publish plan and version together so training ranks cannot read
++            # a new plan paired with the previous version (or vice versa).
++            with self.client.pipeline(transaction=True) as pipeline:
++                pipeline.set('batch_distribution', str(new_dp))
++                pipeline.set('dp_version', self.dp_version)
++                pipeline.execute()
+         else:
+             logging.warning(f"batch size not found: microbsz={micro_bsz}, globalbsz={global_bsz}")
+ 

@@ -1,0 +1,43 @@
+# Local credentials and private handoff material
+服务器.md
+handoff.md
+**/*.server.md
+
+# Generated artifacts and experiment output
+.DS_Store
+**/.DS_Store
+**/artifacts/
+**/results/
+**/trainlog/
+**/checkpoints/
+**/__pycache__/
+**/build/
+**/dist/
+*.pdf
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.whl
+*.so
+*.o
+*.a
+*.log
+*.pyc
+*.pyo
+*.tgz
+*.tar
+*.gz
+*.zip
+*.7z
+
+# Preserve the upstream checkout locally without creating a gitlink
+/Greyhound/.git
+
+# Local reports and authentication helpers
+/.ops/connect.exp
+/.ops/setup-node2.py
+/.ops/write_report.py
+/Greyhound/复现说明.md
+/Greyhound/复现结果.md
+/Greyhound/多机复现结果.md

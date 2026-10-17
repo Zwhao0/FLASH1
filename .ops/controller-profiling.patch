@@ -1,0 +1,14 @@
+--- a/detector/control_plane/local_controller.py
++++ b/detector/control_plane/local_controller.py
+@@ -124,6 +124,11 @@
+                 # local side should wait it to collect some profile data and report it to global.
+                 # Finally, we should wait until the global controller finishes its validation.
+                 if failed_slow or is_profiling:
++                    # A previous mitigation may still be running. Profile only after
++                    # the global controller actually enables CUDA-event collection.
++                    while self.global_controller_client.get("control_state") != b'1':
++                        logging.info("[Local Controller] Waiting for global profiling state...")
++                        time.sleep(0.5)
+                     logging.critical("[Local Controller] In profiling mode, waiting for profiling results...")
+                     time.sleep(PROFILE_PERIOD)
+                     profiling_res = local_analyzer.get_profile_results(self.record_buffer)
